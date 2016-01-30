@@ -28,7 +28,7 @@ preferences {
             input "isyAddress", "text", title: "ISY Address", required: false, defaultValue: "10.0.1.19"  			// Address of the ISY Hub
             input "isyPort", "number", title: "ISY Port", required: false, defaultValue: 80						// Port to use for the ISY Hub
             input "isyUserName", "text", title: "ISY Username", required: false, defaultValue: "admin"				// Username to use for the ISY Hub
-            input "isyPassword", "text", title: "ISY Password", required: false, defaultValue: "ErgoFlat91"			// Password to use for the ISY Hub
+            input "isyPassword", "text", title: "ISY Password", required: false, defaultValue: "Password"			// Password to use for the ISY Hub
             input "bridgeAddress", "text", title: "Bridge Address", required: false, defaultValue: "10.0.1.44"		// Address of the bridge
             input "bridgePort", "text", title: "Bridge Port", required: false, defaultValue: 3003					// Port of the bridge
             input "bridgeUserName", "text", title: "Bridge Username", required: false, defaultValue: "admin"		// Username to use with the bridge
