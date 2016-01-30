@@ -32,7 +32,7 @@ preferences {
             input "swannPort", "number", title: "Swann NVR Port", required: false, defaultValue: 85 				// Port to use for the HTTP interface
             input "cameraCount", "number", title: "Camera Count", required: false, defaultValue: 5  					// # of cameras
             input "swannUserName", "text", title: "User Name", required: false, defaultValue: "admin"				// Username to use with the NVR
-			input "swannPassword", "text", title: "Password", required: false, defaultValue: "Alpha1Romero"			// Password to use with the NVR
+			input "swannPassword", "text", title: "Password", required: false, defaultValue: "Password"			// Password to use with the NVR
     }
 }
 
