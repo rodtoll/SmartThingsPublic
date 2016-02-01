@@ -25,17 +25,54 @@ definition(
 
 preferences {
 	section("ISY Configuration") {
-            input "isyAddress", "text", title: "ISY Address", required: false, defaultValue: "10.0.1.19"  			// Address of the ISY Hub
-            input "isyPort", "number", title: "ISY Port", required: false, defaultValue: 80							// Port to use for the ISY Hub
+            input "isyAddress", "text", title: "ISY Address", required: false, defaultValue: "10.0.1.44"  			// Address of the ISY Hub
+            input "isyPort", "number", title: "ISY Port", required: false, defaultValue: 3000							// Port to use for the ISY Hub
             input "isyUserName", "text", title: "ISY Username", required: false, defaultValue: "admin"				// Username to use for the ISY Hub
             input "isyPassword", "text", title: "ISY Password", required: false, defaultValue: "password"			// Password to use for the ISY Hub
-            input "bridgeAddress", "text", title: "Bridge Address", required: false, defaultValue: "10.0.1.49"		// Address of the bridge
-            input "bridgePort", "text", title: "Bridge Port", required: false, defaultValue: 3003					// Port of the bridge
-            input "bridgeUserName", "text", title: "Bridge Username", required: false, defaultValue: "admin"		// Username to use with the bridge
-            input "bridgePassword", "text", title: "Bridge Password", required: false, defaultValue: "password"	// Password to use for the bridge
+            input "bridgeAddress", "text", title: "Bridge Address", required: false, defaultValue: "10.0.1.44"		// Address of the bridge
+            input "bridgePort", "text", title: "Bridge Port", required: false, defaultValue: 3000					// Port of the bridge
     }
 }
 
+// USAGE
+// 
+// You need to load this SmartApp and all the corresponding device types. You then need to run an instance of the st-isy-notify-bridge project which you
+// can find here: https://github.com/rodtoll/st-isy-notify-bridge. This acts as a bridge between the ISY and the SmartThings hubs, fixing up web callback
+// notifications so they will be SmartThings compatible. At the moment SmartThings rejects messages directly from the ISY. (I've put in a request for a fix
+// but nothing yet). Make sure you configure it with your ISY address and port.
+//
+// IMPLEMENTATION NOTES
+//
+// This smartapp runs into a lot of SmartThings limitations. Specifically it runs into the maximum message size for REST responses (~32k) and maximum
+// exeuction time (20s). As a result, it splits a number of operations into multiple steps to keep from triggering these limits. On smaller setups
+// it might be possible to reduce steps but I wanted it to remain flexible. 
+//
+// The smartapp runs through a lot of states to load all of the data. Here is the loading sequence:
+// 1. Call into ISY and get the current status of nodes using /rest/status. This is used because the /rest/nodes message can exceed 32k.
+//    The nodes are enumerated and used to build a list of potential ISY devices. The results are put into the atomicState.rawNodeList
+//    STATES: InitialStatusRequest => LoadingNodeDetails
+// 2. The smartapp then walks through the list of raw nodes and sends a query to ISY to get details on the node. Uses the /rest/node/<address>
+//    command. The response is then used to detect the type of device, create it and then set the current state. Note that there are some device
+//    types which are represented by multiple nodes. For these nodes they are ignored as the primary device will handle the changes. Device addresses
+//    (dnis) will be either the address (for non-composite) or the main address (for composite). 
+//    STATES: LoadingDetails(X) => LoadingDetails(X-1)
+// 3. When the entire list of devices has been run through then the smart app requests the topology of the elk network using /rest/elk/get/topology.
+//    STATES: LoadElk
+// 4. The smartapp will then call status multiple times to look through the results and find elk devices which are present and create corresponding
+//    devices. It will do this 3 times, each time processing a third of the nodes. When the list is done it goes into the next state. The messages
+//    used are /rest/elk/status
+//    STATES: LoadElkStatus0 => LoadElkStatus1 => LoadElkStatus2 
+// 5. The smartapp will then call status multiple times to look through the results and set the current state of the elk devices. It will do this 5 
+//    times. Each time it will process a fifth of the nodes. When the list is done it goes into the next state.
+//    STATES: LoadElkStatusDetails:0 => LoadElkStatusDetails:1 => LoadElkStatusDetails:2 => LoadElkStatusDetails:3 => LoadElkStatusDetails:4
+// 6. The smartapp will then finish by subscribing the change notifications from the ISY.
+//    STATES: SendSubscribe => LoadCompleted
+
+///////////////////////////////////////////////////////////
+// Startup and Shutdown
+//
+
+// Called when the smart app is installed
 def installed() {
 	setCurrentLoadState("Startup")
     atomicState.rawNodeList = []
@@ -44,41 +81,145 @@ def installed() {
 	initialize()
 }
 
+// Called when settings are updated. This is always called twice during startup for some reason
 def updated() {
 	log.debug "ISYSMARTAPP: Updated with settings: ${settings}"
 }
 
-private getAuthorization() {
-    def userpassascii = settings.isyUserName + ":" + settings.isyPassword
-    "Basic " + userpassascii.encodeAsBase64().toString()
+// Initializes the SmartApp
+def initialize() {
+	setCurrentLoadState("Setup")
+	findPhysicalHub()
+	subscribe(location, null, locationHandler, [filterEvents:false])
+	setCurrentLoadState("InitialStatusRequest")
+    sendStatusRequest()
 }
 
-private getMainAddress(sourceAddress) {
-	def addressComponents = sourceAddress.split(' ')
-    if(addressComponents.size() > 3) {
-    	return addressComponents[0]+' '+addressComponents[1]+' '+addressComponents[2]
+def uninstalled() {
+	def currentState = getCurrentLoadState()
+	log.debug "ISYSMARTAPP: Uninstalling. In current state: "+currentState
+	if(atomicState.hubDni != null && currentState == "LoadCompleted") {
+		sendUnSubscribeCommand()
     } else {
-    	return sourceAddress;
+    	log.debug "ISYSMARTAPP: Not unsubscribing, not needed."
     }
 }
 
-private getSubAddress(sourceAddress) {
-	def addressComponents = sourceAddress.split(' ')
-    if(addressComponents.size() > 3) {
-    	return addressComponents[3]
+///////////////////////////////////////////////////////////
+// Device change notification management
+//
+
+def sendSubscribeCommand() {
+    def dni = makeNetworkId(settings.isyAddress,settings.isyPort)
+    atomicState.hubDni = dni
+	log.debug "ISYSMARTAPP: Now we are sending out subscribe for changes.."+dni
+	def newDevice = addChildDevice('rodtoll', 'ISYHub', dni, location.hubs[atomicState.hubIndex].id, [label:"ISY Hub",completedSetup: true])
+    newDevice.setParameters(settings.isyAddress,settings.isyPort,settings.isyUserName,settings.bridgeAddress,settings.bridgePort,settings.isyUserName,settings.isyPassword)
+    newDevice.subscribe(atomicState.hubIndex)
+}
+
+def sendUnSubscribeCommand() {
+    log.debug "ISYSMARTAPP: Doing an unsubscribe"
+    def hubDevice = getChildDevice(atomicState.hubDni);
+    hubDevice.unsubscribe()
+}
+
+///////////////////////////////////////////////////////////
+// Smart App state tracking
+//
+
+def setCurrentLoadState(state) {
+    atomicState.loadingState = state
+    log.debug "ISYSMARTAPP: #### Transitioning to state: "+state
+}
+
+def getCurrentLoadState() {
+	return atomicState.loadingState
+}
+
+///////////////////////////////////////////////////////////
+// Main Message Handler and state handler
+//
+def handleXmlMessage(xml) {
+	//log.debug "ISYSMARTAPP: Incoming message type: "+xml.name()
+	def currentState = getCurrentLoadState()
+    if(xml.name() == 'nodes') {
+        handleInitialStatusMessage(xml)
+        setCurrentLoadState("LoadingNodeDetails")
+        sendNextGetInfoRequest()
+    } else if(xml.name() == 'nodeInfo') {
+        handleNodeInfoMessage(xml)
+		if(!sendNextGetInfoRequest()) {
+            setCurrentLoadState('LoadElk')
+            sendElkTopologyRequest()
+        }
+    } else if(xml.name() == 'topology') {
+        handleElkTopologyMessage(xml)
+        setCurrentLoadState('LoadElkStatus:0')
+        sendElkStatusRequest()        
+    } else if(xml.name() == 'status') {
+        if(currentState.startsWith('LoadElkStatusDetails')) {
+        	def passId = currentState.split(':')[1].toInteger()
+            handleElkStatusMessageForDetails(xml,passId)
+            passId++
+            if(passId <= 2) {
+                setCurrentLoadState('LoadElkStatusDetails:'+passId)
+                sendElkStatusRequest()   	
+            } else {
+                setCurrentLoadState("SendSubscribe")       
+                sendSubscribeCommand()
+            }
+        } else {
+        	def passId = currentState.split(':')[1].toInteger()
+           	handleElkStatusMessage(xml,passId)
+            passId++
+            if(passId <= 4) {
+				setCurrentLoadState('LoadElkStatus:'+passId)
+            } else {
+            	setCurrentLoadState('LoadElkStatusDetails:0')
+            }
+            sendElkStatusRequest()
+        }
+    } else if(xml.name() == 'Envelope') {
+        setCurrentLoadState("LoadCompleted")
+        def hubDevice = getChildDevice(atomicState.hubDni)
+        log.debug 'ISYSMARTAPP: Hub device '+hubDevice
+        log.debug 'ISYSMARTAPP: XML: '+xml.toString()
+        hubDevice.setSubscribIdFromResponse(xml)
+    } else if(xml.name() == 'Event') {
+        handleNodeUpdateMessage(xml)
     } else {
-    	return '1';
+        log.debug 'ISYSMARTAPP: Ignoring malformed message. Message='+xml.name()
     }
 }
 
-def findDevice(address) {
-    def device = getChildDevice(address)
-    if(!device) {
-        device = getChildDevice(getMainAddress(incomingAddress))
-    }
-    return deviceToUpdate
+// Handles incoming messages to the SmartApp.
+// Handles fixup to ensure it is in xml format then handles to the parser.
+def locationHandler(evt) {
+    def msg = parseLanMessage(evt.description)
+	//log.debug "ISYSMARTAPP: Incoming message..."+msg
+    if(!msg.xml) {
+    	// The ISY doesn't always seem to properly specify the content-type to activate automatic xml parsing
+        // So if we have content and xml is not present try and manually parse it into xml
+        if(msg.body && msg.body.length() > 0) {
+            msg.xml = new XmlSlurper().parseText(msg.body)
+        }
+    } 
+    if(msg.xml) {
+    	//log.debug "ISYSMARTAPP: Xml message being process"
+        handleXmlMessage(msg.xml)
+    } 
 }
 
+///////////////////////////////////////////////////////////
+// ISY General Message Handlers
+//
+
+// Handle the first status message
+// 
+// This is used to determine the list of ISY addresses which may be devices. 
+//
+// Handles result of sendStatusRequest message
 def handleInitialStatusMessage(xml) {
     log.debug 'ISYSMARTAPP: Processing status response'
 
@@ -98,24 +239,366 @@ def handleInitialStatusMessage(xml) {
     log.debug 'ISYSMARTAPP: Device address list generated. Potential devices: '+atomicState.rawNodeList.size()
 }
 
-def handleStatusMessage(xml) {
-    log.debug 'ISYSMARTAPP: Processing status response'
-    xml.node.each {
-        def attributeMap = it.attributes()
-        def nodeAddress = attributeMap['id']
-        // This is a refresh
-        def device = findDevice(nodeAddress) 
-        if(device != null) {
-            def value = it.property.attributes()['value'].toString()
-            if(!value.isInteger()) {
-                log.debug "Setting value which is not an int..."+value
-                device.setISYState(nodeAddress,value)
+// Handles creating a device for the device node specified in the xml paramter.
+// 
+// This message comes from a response from a sendGetNodeInfo() message.
+//
+def handleNodeInfoMessage(xml) {
+    // Parse out device details
+    def address = xml.node.address.toString()
+    def name = xml.node.name.toString()
+    def devType = xml.node.type.toString()
+    def enabled = xml.node.enabled.toString().toBoolean()    
+    def propNode = xml.node.'property'
+  
+  	// This node has no value. Not supported in this SmartApp
+    if(propNode.size() == 0) {
+    	log.debug "ISYSMARTAPP: Skipping node without property. Not supported"
+        enabled = false;
+    }
+    
+    // Only include devices which are enabled
+    if(enabled) {
+    	// Get current device state
+        def propAttributes = propNode[0].attributes()
+        def stateValue = propAttributes['value'].toString()
+        def formattedValue = propAttributes['formatted'].toString()
+        def uomValue = propAttributes['uom'].toString()
+    
+        // Determine root address to use and sub-address for sub-devices
+        def rootAddress = getIsyMainAddress(address) 
+        def subAddress = getIsySubAddress(address)
+
+        // Determine isy device type
+        def isyType = 'U'
+        def isyCollect = false
+
+		// Determine device family
+        def familyId = getFamilyIdFromDevice(xml.node)
+        
+        // Normalize missing state values
+        if(stateValue == null || stateValue == "" || stateValue == " ") {
+        	stateValue = " "
+        }
+        
+        // Determine the device type
+        if(familyId == 1) {
+        	isyType = getIsyType(devType, address, uomValue)
+        } else if(familyId == 4) {
+        	def zWaveSubType = xml.node.devtype.cat.toString().toInteger()
+        	isyType = getZWaveType(zWaveSubType)
+        }
+
+        def addressToUse = address
+
+        // Mark devices which we want to treat as composites as such
+        if(isCompoundIsyDevice(isyType)) {
+            isyCollect = true
+            addressToUse = rootAddress
+        }
+
+        log.debug 'ISYSMARTAPP: DEVICE: isyType='+isyType+' addr='+address+' rootAddress='+rootAddress+' subAddr='+subAddress+' name='+name+' isyType='+isyType+' isyCollect='+isyCollect+' devType='+devType+' state='+stateValue+' form='+formattedValue+' uom='+uomValue
+
+        def newDevice = null
+
+        if(isyCollect && getChildDevice(addressToUse) != null) {
+            newDevice = getChildDevice(addressToUse)
+        } else {
+            if(isyType == "DL" ) {
+                //log.debug "ISYSMARTAPP: Creating Dimmable device"
+                newDevice = addChildDevice('rodtoll', 'ISYDimmableLight', addressToUse, null, [label:name,completedSetup: true])
+            } else if(isyType == "L") {
+                //log.debug "ISYSMARTAPP: Creating On Off Light device"
+                newDevice = addChildDevice('rodtoll', 'ISYOnOffLight', addressToUse, null, [label:name,completedSetup:true])
+            } else if(isyType == "F") {
+                //log.debug "ISYSMARTAPP: Creating FAN device"
+                newDevice = addChildDevice('rodtoll', 'ISYFanLinc', addressToUse, null, [label:name,completedSetup:true])
+            } else if(isyType == "O") {
+                //log.debug "ISYSMARTAPP: Creating Outlet device"
+                newDevice = addChildDevice('rodtoll', 'ISYOutlet', addressToUse, null, [label:name,completedSetup:true])  
+            } else if(isyType == "CS") {
+                //log.debug "ISYSMARTAPP: Creating Contact Sensor device"
+                newDevice = addChildDevice('rodtoll', 'ISYContactSensor', addressToUse, null, [label:name,completedSetup:true]) 
+            } else if(isyType == "IM") {
+                //log.debug "ISYSMARTAPP: Creating Motion Sensor device"
+                newDevice = addChildDevice('rodtoll', 'ISYMotionSensor', addressToUse, null, [label:name,completedSetup:true])   
+            } else if(isyType == "ML") {
+                //log.debug "ISYSMARTAPP: Creating MorningLinc device"
+                newDevice = addChildDevice('rodtoll', 'ISYMorningLinc', addressToUse, null, [label:name,completedSetup:true])    
+            } else if(isyType == "ZL") {
+                //log.debug "ISYSMARTAPP: Creating ZWaveLock device"
+                newDevice = addChildDevice('rodtoll', 'ISYZWaveLock', addressToUse, null, [label:name,completedSetup:true])                   
             } else {
-                log.debug "Setting value whicvh is an int..."+value
-                device.setISYState(nodeAddress,0)
+                log.debug "ISYSMARTAPP: Ignoring device: dni="+addressToUse+"+ name="+name+" type="+isyType
+            }
+        }
+
+		// If we have a device set it's initial state 
+        if(newDevice != null) {
+            if(stateValue == " ") {
+                //log.debug "ISYSMARTAPP: Setting blank default state on device: "+name
+                newDevice.setISYState(address, stateValue)
+            } else {
+                newDevice.setISYState(address, stateValue.toInteger())
+            }
+        }
+    } else {
+	    log.debug 'ISYSMARTAPP: Ignoring disabled device. Address='+address
+    }
+}
+
+// Handles an update message from the ISY. These come from web notifications
+def handleNodeUpdateMessage(xml) {
+	// Device state update
+    if(xml.control.toString() == 'ST') {
+    	handleIsyDeviceUpdate(xml)
+    // Elk state update
+    } else if(xml.control.toString() == '_19') {
+		handleElkZoneUpdate(xml)
+    }
+}
+
+// HELPER: Gets the family id from the device node entry
+def getFamilyIdFromDevice(deviceNode) {	
+	def familyNode = deviceNode.family
+    if(familyNode != null) {
+        if(familyNode.toString().isInteger()) {
+            return familyNode.toString().toInteger()
+        }
+    }
+    return 1
+}
+
+// HELPER: Sends the message to get the next device if there are any left in the raw list
+def sendNextGetInfoRequest() {
+	def rawNodeList = atomicState.rawNodeList
+	if( rawNodeList == null) {
+    	log.debug "ISYSMARTAPP: IGNORING GetNextInfo because we are not yet setup."
+        return false
+    }
+    if(rawNodeList.size() > 0) {
+	    setCurrentLoadState("LoadingDetails"+atomicState.rawNodeList.size())          
+    	def nextAddress = rawNodeList[0]
+        rawNodeList.remove(0)
+        atomicState.rawNodeList = rawNodeList
+        sendGetNodeInfo(nextAddress)
+        return true
+    } else {
+    	atomicState.rawNodeList = null
+        return false
+    }
+}
+
+// HELPER: Processes a web notification when it is for a non-Elk device
+def handleIsyDeviceUpdate(xml) {
+    def incomingAddress = xml.node.toString()
+    def deviceToUpdate = getChildDevice(incomingAddress)
+    if(!deviceToUpdate) {
+        deviceToUpdate = getChildDevice(getIsyMainAddress(incomingAddress))
+    }
+    if(deviceToUpdate) {
+        if(xml.action == null || !xml.action.toString().isInteger()) {
+            //log.debug "ISYSMARTAPP: Incoming message had a blank or wrong device state value..."
+            deviceToUpdate.setISYState(incomingAddress, " ")
+        } else {
+            deviceToUpdate.setISYState(incomingAddress, xml.action.toString().toInteger())
+        }
+    } 
+}
+
+///////////////////////////////////////////////////////////
+// Elk General Message Handlers
+//
+
+def handleElkTopologyMessage(xml) {
+    log.debug 'ISYSMARTAPP: Processing Elk Topology Response'
+    def rawElkNodeList = [:]
+    def elkDeviceCount = 0
+    xml.areas.area[0].zone.each {
+        def elkZoneId = it['@id'].toString()
+        def elkZoneName = it['@name'].toString()
+        def elkAlarmDef = it['@alarmDef'].toString()
+        rawElkNodeList.put(elkZoneId, elkZoneName+"@"+elkAlarmDef)
+        elkDeviceCount++
+    }
+    atomicState.rawElkZoneList = rawElkNodeList
+}
+    
+def handleElkStatusMessage(xml, passId) {
+    def rawElkZoneList = atomicState.rawElkZoneList
+	log.debug 'ISYSMARTAPP: Processing elk status response - Pass: '+passId
+    for(def index = 0; index < xml.ze.size(); index++) {
+    	if(index % 5 != passId) {
+        	continue;
+        } 
+    	def zeEntry = xml.ze[index]
+    	def zoneId = zeEntry['@zone'].toString()
+        def type = zeEntry['@type'].toString()
+        def val = zeEntry['@val'].toString()
+        if(type == '53') {
+        	def zoneParts = rawElkZoneList[zoneId].split('@')
+            def zoneName = zoneParts[0]
+            def zoneAlarmDef = zoneParts[1].toInteger()
+        	if(zoneName != null) {
+                def voltage = val.toInteger();
+                if(voltage < 65 || voltage > 80) {
+            		def addressToUse = getDeviceNetworkIdForElkZone(zoneId)
+                    //log.debug 'ISYSMARTAPP: Adding device: '+addressToUse
+                    if(zoneAlarmDef == 17) {
+	                    addChildDevice('rodtoll', 'ISYElkCOSensor', addressToUse, null, [label:zoneName,completedSetup:true]) 
+					} else if(zoneAlarmDef != 15) {
+	                    addChildDevice('rodtoll', 'ISYElkAlarmSensor', addressToUse, null, [label:zoneName,completedSetup:true]) 
+                    }
+				}
             }
         }
     }
+}
+
+def handleElkStatusMessageForDetails(xml,passId) {
+	log.debug 'ISYSMARTAPP: Processing elk status response - details stage - pass:'+passId
+    def currentLoadingState = getCurrentLoadState()
+
+    for(def index = 0; index < xml.ze.size(); index++) {
+    	if(index % 3 != passId) {
+        	continue
+        }
+        def zeEntry = xml.ze[index]
+    	def zoneId = zeEntry['@zone'].toString()
+        def type = zeEntry['@type'].toString().toInteger()
+        def val = zeEntry['@val'].toString().toInteger()
+        
+		def addressToUse = getDeviceNetworkIdForElkZone(zoneId)
+        def deviceToUpdate = getChildDevice(addressToUse)
+        
+        if(deviceToUpdate != null && type == 51) {
+            deviceToUpdate.setZone(zoneId)
+            deviceToUpdate.setFromZoneUpdate(type,val)
+        }
+    }
+}
+
+// HELPER: Processes a web notification when it is for an Elk device
+def handleElkZoneUpdate(xml) {
+    if(xml.action != null && xml.action.toString().isInteger()) {
+        def actionType = xml.action.toString().toInteger()
+        if(actionType == 3) {
+            def zeNode = xml.eventInfo.ze
+            def zoneId = zeNode['@zone'].toInteger()
+            def type = zeNode['@type'].toInteger()
+            def value = zeNode['@val'].toInteger()
+            def elkDni = getDeviceNetworkIdForElkZone(zoneId)
+            def elkDevice = getChildDevice(elkDni)
+            if(elkDevice != null) {
+                elkDevice.setFromZoneUpdate(type,value)
+            } else {
+                log.debug "ISYSMARTAPP: Could not find specified elk device"
+            }
+        } else {
+            log.debug "ISYSMARTAPP: Ignoring actionType "+actionType+" message"
+        }
+    } else {
+        log.debug "ISYSMARTAPP: Incoming update doesn't have an action element, skipping"
+    }
+}
+
+///////////////////////////////////////////////////////////
+// Generic Helper functions
+//
+
+private String makeNetworkId(ipaddr, port) { 
+     String hexIp = ipaddr.tokenize('.').collect { 
+     String.format('%02X', it.toInteger()) 
+     }.join() 
+     String hexPort = String.format('%04X', port) 
+     return "${hexIp}:${hexPort}" 
+}
+
+def findPhysicalHub() {
+    def savedIndex = 0
+	for (def i = 0; i < location.hubs.size(); i++) {
+        def hub = location.hubs[i]
+        if(hub.type.toString() == "PHYSICAL") {
+        	savedIndex = i
+        }
+    }
+    log.debug "ISYSMARTAPP: Picking hub: "+savedIndex
+    atomicState.hubIndex = savedIndex
+}
+
+
+///////////////////////////////////////////////////////////
+// REST Request Basics
+//
+
+def getDeviceAddressSafeForUrl(device) {
+	return getStringSafeForUrl(device.device.deviceNetworkId)
+}
+
+def getStringSafeForUrl(value) {
+	return value.toString().replaceAll(' ', '%20')
+}
+
+private getAuthorization(userName, password) {
+    def userpassascii = userName + ":" + password
+    return "Basic " + userpassascii.encodeAsBase64().toString()
+}
+
+def getRestGetRequest(path) {
+	//log.debug "Building request..."+path+" host: "+settings.isyAddress+":"+settings.isyPort+" auth="+getAuthorization(settings.isyUserName, settings.isyPassword)
+    new physicalgraph.device.HubAction(
+        'method': 'GET',
+        'path': path,
+        'headers': [
+            'HOST': settings.isyAddress+":"+settings.isyPort,
+            'Authorization': getAuthorization(settings.isyUserName, settings.isyPassword)
+        ], null)
+}
+
+///////////////////////////////////////////////////////////
+// Elk Helper functions
+//
+
+def getDeviceNetworkIdForElkZone(zone) {
+	return settings.isyAddress+'#Elk#'+zone
+}
+
+///////////////////////////////////////////////////////////
+// ISY Helper functions
+//
+
+private getIsyMainAddress(sourceAddress) {
+	def addressComponents = sourceAddress.split(' ')
+    if(addressComponents.size() > 3) {
+    	return addressComponents[0]+' '+addressComponents[1]+' '+addressComponents[2]
+    } else {
+    	return sourceAddress;
+    }
+}
+
+private getIsySubAddress(sourceAddress) {
+	def addressComponents = sourceAddress.split(' ')
+    if(addressComponents.size() > 3) {
+    	return addressComponents[3]
+    } else {
+    	return '1';
+    }
+}
+
+def scaleISYDeviceLevelToSTRange(incomingLevel) {
+    def topOfLevel = 99 * incomingLevel
+    def bottomOfLevel = 255
+    def scaledLevel = topOfLevel / bottomOfLevel
+    def scaled2Level = (Integer) (Math.ceil(topOfLevel / bottomOfLevel))
+    scaled2Level
+}
+
+def scaleSTRangeToISYDeviceLevel(incomingLevel) {
+	def topOfLevel = 255 * incomingLevel
+    def bottomOfLevel = 99
+    def scaledLevel = topOfLevel / bottomOfLevel
+    def scaled2Level = (Integer) (Math.ceil(topOfLevel / bottomOfLevel))
+	scaled2Level
 }
 
 def getIsyType(devType, address, uom) {
@@ -184,23 +667,7 @@ def getIsyType(devType, address, uom) {
     }
 }
 
-def findHub() {
-    def savedIndex = 0
-    
-	for (def i = 0; i < location.hubs.size(); i++) {
-        def hub = location.hubs[i]
-        if(hub.type.toString() == "PHYSICAL") {
-        	savedIndex = i
-        }
-    }
-    
-    log.debug "ISYSMARTAPP: Picking hub: "+savedIndex
-    
-    atomicState.hubIndex = savedIndex
-}
-
-def getZWaveType(nodeXml) {
-	def zWaveSubType = nodeXml?.devtype?.cat?.toString().toInteger()
+def getZWaveType(zWaveSubType) {
     if(zWaveSubType != null) {
     	if(zWaveSubType == 111) {
         	return "ZL"
@@ -210,548 +677,45 @@ def getZWaveType(nodeXml) {
     }
 }
 
-// When we get the response from the node info request create the device
-def handleNodeInfoMessage(xml) {
-    // Parse out device details
-    def address = xml.node.address.toString()
-    def name = xml.node.name.toString()
-    def devType = xml.node.type.toString()
-    def enabled = xml.node.enabled.toString().toBoolean()    
-    def propNode = xml.node.'property'
-    if(propNode.size() == 0) {
-    	log.debug "ISYSMARTAPP: Skipping node without property. Not supported"
-        enabled = false;
-    }
-    
-    if(enabled) {
-        def propAttributes = propNode[0].attributes()
-        def stateValue = propAttributes['value'].toString()
-        def formattedValue = propAttributes['formatted'].toString()
-        def uomValue = propAttributes['uom'].toString()
-    
-        // Determine root address to use and sub-address for sub-devices
-        def rootAddress = getMainAddress(address) 
-        def subAddress = getSubAddress(address)
-
-        // Fix up statevalue
-        if(stateValue == null) {
-            stateValue = " "
-        }    
-
-        // Determine isy device type
-        def isyType = 'U'
-        def isyCollect = false
-
-		def familyNode = xml.node.family
-        def familyId = null;
-        
-        if(familyNode != null) {
-        	if(familyNode.toString().isInteger()) {
-        		familyId = familyNode.toString().toInteger()
-            }
-        }
-        
-        if(familyId == null) {
-        	isyType = getIsyType(devType.toString(), address.toString(), uomValue.toString())
-        } else if(familyId == 4) {
-        	isyType = getZWaveType(xml.node)
-        }
-
-        def addressToUse = address
-
-        // Mark devices which we want to treat as composites as such
-        if(isyType == 'IO' || isyType == 'IM' || isyType == 'CS') {
-            isyCollect = true
-            addressToUse = rootAddress
-        }
-
-        log.debug 'ISYSMARTAPP: DEVICE: isyType='+isyType+' addr='+address+' rootAddress='+rootAddress+' subAddr='+subAddress+' name='+name+' isyType='+isyType+' isyCollect='+isyCollect+' devType='+devType+' state='+stateValue+' form='+formattedValue+' uom='+uomValue
-
-        def newDevice = null
-
-        if(isyCollect && getChildDevice(addressToUse) != null) {
-            newDevice = getChildDevice(addressToUse)
-        } else {
-            if(isyType == "DL" ) {
-                //log.debug "ISYSMARTAPP: Creating Dimmable device"
-                newDevice = addChildDevice('rodtoll', 'ISYDimmableLight', addressToUse, null, [label:name,completedSetup: true])
-            } else if(isyType == "L") {
-                //log.debug "ISYSMARTAPP: Creating On Off Light device"
-                newDevice = addChildDevice('rodtoll', 'ISYOnOffLight', addressToUse, null, [label:name,completedSetup:true])
-            } else if(isyType == "F") {
-                //log.debug "ISYSMARTAPP: Creating FAN device"
-                newDevice = addChildDevice('rodtoll', 'ISYFanLinc', addressToUse, null, [label:name,completedSetup:true])
-            } else if(isyType == "O") {
-                //log.debug "ISYSMARTAPP: Creating Outlet device"
-                newDevice = addChildDevice('rodtoll', 'ISYOutlet', addressToUse, null, [label:name,completedSetup:true])  
-            } else if(isyType == "CS") {
-                //log.debug "ISYSMARTAPP: Creating Contact Sensor device"
-                newDevice = addChildDevice('rodtoll', 'ISYContactSensor', addressToUse, null, [label:name,completedSetup:true]) 
-            } else if(isyType == "IM") {
-                //log.debug "ISYSMARTAPP: Creating Motion Sensor device"
-                newDevice = addChildDevice('rodtoll', 'ISYMotionSensor', addressToUse, null, [label:name,completedSetup:true])   
-            } else if(isyType == "ML") {
-                //log.debug "ISYSMARTAPP: Creating MorningLinc device"
-                newDevice = addChildDevice('rodtoll', 'ISYMorningLinc', addressToUse, null, [label:name,completedSetup:true])    
-            } else if(isyType == "ZL") {
-                //log.debug "ISYSMARTAPP: Creating ZWaveLock device"
-                newDevice = addChildDevice('rodtoll', 'ISYZWaveLock', addressToUse, null, [label:name,completedSetup:true])                   
-            } else {
-                log.debug "ISYSMARTAPP: Ignoring device: dni="+addressToUse+"+ name="+name+" type="+isyType
-            }
-        }
-
-        if(newDevice != null) {
-            if(stateValue == ' ') {
-                //log.debug "ISYSMARTAPP: Setting blank default state on device: "+name
-                newDevice.setISYState(address, stateValue)
-            } else {
-                newDevice.setISYState(address, stateValue.toInteger())
-            }
-        }
-    } else {
-	    log.debug 'ISYSMARTAPP: Ignoring disabled device. Address='+address
-    }
-
-    sendNextGetInfoRequest()
+def isCompoundIsyDevice(isyType) {
+	return (isyType == 'IO' || isyType == 'IM' || isyType == 'CS')	
 }
 
-def scaleISYDeviceLevelToSTRange(incomingLevel) {
-    def topOfLevel = 99 * incomingLevel
-    def bottomOfLevel = 255
-    def scaledLevel = topOfLevel / bottomOfLevel
-    def scaled2Level = (Integer) (Math.ceil(topOfLevel / bottomOfLevel))
-    scaled2Level
-}
-
-def scaleSTRangeToISYDeviceLevel(incomingLevel) {
-	def topOfLevel = 255 * incomingLevel
-    def bottomOfLevel = 99
-    def scaledLevel = topOfLevel / bottomOfLevel
-    def scaled2Level = (Integer) (Math.ceil(topOfLevel / bottomOfLevel))
-	scaled2Level
-}
-
-def getDeviceNetworkIdForElkZone(zone) {
-	return settings.isyAddress+'#Elk#'+zone
-}
-
-def handleNodeUpdateMessage(xml) {
-    if(xml.control.toString() == 'ST') {
-    	def incomingAddress = xml.node.toString()
-        def deviceToUpdate = getChildDevice(incomingAddress)
-        if(!deviceToUpdate) {
-        	deviceToUpdate = getChildDevice(getMainAddress(incomingAddress))
-        }
-        if(deviceToUpdate) {
-            if(xml.action == null || !xml.action.toString().isInteger()) {
-            	//log.debug "ISYSMARTAPP: Incoming message had a blank or wrong device state value..."
-            	deviceToUpdate.setISYState(incomingAddress, " ")
-            } else {
-            	deviceToUpdate.setISYState(incomingAddress, xml.action.toString().toInteger())
-            }
-        } 
-    } else if(xml.control.toString() == '_19') {
-    	if(xml.action != null && xml.action.toString().isInteger()) {
-        	def actionType = xml.action.toString().toInteger()
-            if(actionType == 3) {
-            	def zeNode = xml.eventInfo.ze
-                def zoneId = zeNode['@zone'].toInteger()
-				def type = zeNode['@type'].toInteger()
-                def value = zeNode['@val'].toInteger()
-                def elkDni = getDeviceNetworkIdForElkZone(zoneId)
-                def elkDevice = getChildDevice(elkDni)
-                if(elkDevice != null) {
-                    elkDevice.setFromZoneUpdate(type,value)
-                } else {
-                	log.debug "ISYSMARTAPP: Could not find specified elk device"
-                }
-            } else {
-            	log.debug "ISYSMARTAPP: Ignoring actionType "+actionType+" message"
-            }
-        } else {
-        	log.debug "ISYSMARTAPP: Incoming update doesn't have an action element, skipping"
-        }
-    }
-}
-
-private String makeNetworkId(ipaddr, port) { 
-     String hexIp = ipaddr.tokenize('.').collect { 
-     String.format('%02X', it.toInteger()) 
-     }.join() 
-     String hexPort = String.format('%04X', port) 
-     return "${hexIp}:${hexPort}" 
-}
-
-def sendSubscribeCommand() {
-    setCurrentLoadState("SendSubscribe")       
-    def dni = makeNetworkId(settings.isyAddress,settings.isyPort)
-    atomicState.hubDni = dni
-	log.debug "ISYSMARTAPP: Now we are sending out subscribe for changes.."+dni
-	def newDevice = addChildDevice('rodtoll', 'ISYHub', dni, location.hubs[atomicState.hubIndex].id, [label:"ISY Hub",completedSetup: true])
-    newDevice.setParameters(settings.isyAddress,settings.isyPort,settings.isyUserName,settings.bridgeAddress,settings.bridgePort,settings.bridgeUserName,settings.bridgePassword)
-    newDevice.subscribe(atomicState.hubIndex)
-}
-    
-def sendNextGetInfoRequest() {
-	if(atomicState.rawNodeList == null) {
-    	log.debug "ISYSMARTAPP: IGNORING GetNextInfo because we are not yet setup."
-        return
-    }
-    if(atomicState.rawNodeList.size() > 0) {
-	    setCurrentLoadState("LoadingDetails"+atomicState.rawNodeList.size())          
-    	//log.debug "ISYSMARTAPP: Enumerating devices now... let's do the next one."
-    	def nextAddress = atomicState.rawNodeList[0]
-        def nodeList = atomicState.rawNodeList
-        nodeList.remove(0)
-        atomicState.rawNodeList = nodeList
-        def requestPath = '/rest/nodes/'+nextAddress
-        requestPath = requestPath.replaceAll(" ", "%20")
-    	//log.debug "ISYSMARTAPP: Sending request... "+requestPath
-        sendHubCommand(getRequest(requestPath))
-    } else {
-    	atomicState.rawNodeList = null
-        setCurrentLoadState('LoadElk')
-        sendHubCommand(getRequest('/rest/elk/get/topology'))
-    }
-}
-
-def setCurrentLoadState(state) {
-    atomicState.loadingState = state
-    log.debug "ISYSMARTAPP: #### Transitioning to state: "+state
-}
-
-def oldHandleElkTopologyMessage(xml) {
-    //log.debug 'ISYSMARTAPP: Processing Elk Topology Response'
-    def potentialElkNodes = []
-    def elkDeviceCount = 0
-    xml.areas.area[0].zone.each {
-        def elkZoneId = it['@id'].toString()
-        def elkZoneName = it['@name'].toString()
-        //log.debug 'ISYSMARTAPP: Discovered elk device zone: '+elkZoneId+' name: '+elkZoneName
-        potentialElkNodes << elkZoneName + '@' + elkZoneId 
-        elkDeviceCount++
-    }
-    //log.debug 'ISYSMARTAPP: Done list'
-    atomicState.rawElkZoneList = potentialElkNodes
-    //log.debug 'ISYSMARTAPP: Elk Device list generated. Potential devices: '+atomicState.rawElkZoneList.size()
-    setCurrentLoadState('LoadElkStatus')
-    sendHubCommand(getRequest('/rest/elk/get/status'))
-}
-
-def handleElkTopologyMessage(xml) {
-    log.debug 'ISYSMARTAPP: Processing Elk Topology Response'
-    def rawElkNodeList = [:]
-    def elkDeviceCount = 0
-    xml.areas.area[0].zone.each {
-        def elkZoneId = it['@id'].toString()
-        def elkZoneName = it['@name'].toString()
-        def elkAlarmDef = it['@alarmDef'].toString()
-        rawElkNodeList.put(elkZoneId, elkZoneName+"@"+elkAlarmDef)
-        elkDeviceCount++
-    }
-    atomicState.rawElkZoneList = rawElkNodeList
-    setCurrentLoadState('LoadElkStatus1')
-    sendHubCommand(getRequest('/rest/elk/get/status'))
-}
-
-/*def handleElkStatusMessage1(xml) {
-	log.debug 'ISYSMARTAPP: Processing elk status response - 1st stage'
-    
-    def rawElkZoneList = atomicState.rawElkZoneList;
-    
-	xml.ze.each {
-    
-    	def zoneId = it['@zone'].toString()
-        def type = it['@type'].toString()
-        def val = it['@val'].toString()
-        
-        if(type == '53') {
-        	if(rawElkZoneList.contains(zoneId)) {
-                def voltage = val.toInteger();
-                if(voltageEntry < 65 || voltageEntry > 80) {
-                	def name = rawElkZone[zoneId]
-                    addChildDevice('rodtoll', 'ISYElkAlarmSensor', addressToUse, null, [label:name,completedSetup:true]) 
-                }
-            }
-        }
-    }
-    
-    setCurrentLoadState('LoadElkStatusDetails')
-    sendHubCommand(gerRequest('/rest/elk/get/status'))
-}*/
-    
-def handleElkStatusMessage(xml) {
-    def rawElkZoneList = atomicState.rawElkZoneList
-    def passId = 0
-    
-    def currentState = atomicState.loadingState
-    
-    if(currentState == "LoadElkStatus1") {
-    	passId = 0
-    } else if(currentState == "LoadElkStatus2") {
-    	passId = 1
-    } else if(currentState == "LoadElkStatus3") {
-    	passId = 2
-    } else if(currentState == "LoadElkStatus4") {
-    	passId = 3
-    } else if(currentState == "LoadElkStatus5") {
-    	passId = 4
-    }
-    
-	log.debug 'ISYSMARTAPP: Processing elk status response - Pass: '+passId
-    
-    for(def index = 0; index < xml.ze.size(); index++) {
-    	if(index % 5 != passId) {
-        	continue;
-        } 
-    	def zeEntry = xml.ze[index]
-    	def zoneId = zeEntry['@zone'].toString()
-        def type = zeEntry['@type'].toString()
-        def val = zeEntry['@val'].toString()
-        if(type == '53') {
-        	def zoneParts = rawElkZoneList[zoneId].split('@')
-            def zoneName = zoneParts[0]
-            def zoneAlarmDef = zoneParts[1].toInteger()
-        	if(zoneName != null) {
-                def voltage = val.toInteger();
-                if(voltage < 65 || voltage > 80) {
-            		def addressToUse = getDeviceNetworkIdForElkZone(zoneId)
-                    //log.debug 'ISYSMARTAPP: Adding device: '+addressToUse
-                    if(zoneAlarmDef == 17) {
-	                    addChildDevice('rodtoll', 'ISYElkCOSensor', addressToUse, null, [label:zoneName,completedSetup:true]) 
-					} else if(zoneAlarmDef != 15) {
-	                    addChildDevice('rodtoll', 'ISYElkAlarmSensor', addressToUse, null, [label:zoneName,completedSetup:true]) 
-                    }
-				}
-            }
-        }
-    }
-    
-	if(passId == 0) {    
-        setCurrentLoadState('LoadElkStatus2')
-    	sendHubCommand(getRequest('/rest/elk/get/status'))
-    } else if(passId == 1) {
-        setCurrentLoadState('LoadElkStatus3')
-    	sendHubCommand(getRequest('/rest/elk/get/status'))
-    } else if(passId == 2) {
-        setCurrentLoadState('LoadElkStatus4')
-    	sendHubCommand(getRequest('/rest/elk/get/status'))
-    } else if(passId == 3) {
-        setCurrentLoadState('LoadElkStatus5')
-    	sendHubCommand(getRequest('/rest/elk/get/status'))        
-	} else {
-	    setCurrentLoadState('LoadElkStatusDetails1')
-    	sendHubCommand(getRequest('/rest/elk/get/status'))
-    }
-}
-
-def handleElkStatusMessageForDetails(xml) {
-	log.debug 'ISYSMARTAPP: Processing elk status response - details stage'
-        
-    for(def index = 0; index < xml.ze.size(); index++) {
-    	if(atomicState.loadingState == "LoadElkStatusDetails1") {
-        	if(index % 3 != 0) {
-            	continue
-            }
-        } else if(atomicState.loadingState == "LoadElkStatusDetails2") {
-        	if(index % 3 != 1) {
-            	continue
-            }
-        } else {
-        	if(index % 3 != 2) {
-            	continue
-            }
-        }
-        def zeEntry = xml.ze[index]
-    	def zoneId = zeEntry['@zone'].toString()
-        def type = zeEntry['@type'].toString().toInteger()
-        def val = zeEntry['@val'].toString().toInteger()
-        
-		def addressToUse = getDeviceNetworkIdForElkZone(zoneId)
-        def deviceToUpdate = getChildDevice(addressToUse)
-        
-        if(deviceToUpdate != null && type == 51) {
-            deviceToUpdate.setZone(zoneId)
-            deviceToUpdate.setFromZoneUpdate(type,val)
-        }
-    }
-    if(atomicState.loadingState == "LoadElkStatusDetails1") {
-        setCurrentLoadState('LoadElkStatusDetails2')
-        sendHubCommand(getRequest('/rest/elk/get/status'))    	
-    } else if(atomicState.loadingState == "LoadElkStatusDetails2") {
-        setCurrentLoadState('LoadElkStatusDetails3')
-        sendHubCommand(getRequest('/rest/elk/get/status'))    	
-    } else {
-//    	setCurrentLoadState('DONE!')
-		sendSubscribeCommand()
-    }
-}
-
-def oldHandleElkStatusMessage(xml) {
-    def rawElkList = [:]
-    
-    def sourceList = atomicState.rawElkZoneList
-    
-    sourceList.each {
-    	def entry = it.split('@')
-        def zoneId = entry[1]
-        def zoneName = entry[0]
-    	def newEntry = ['name': zoneName]
-        rawElkList.put(zoneId, newEntry)
-    }
-    
-    xml.ze.each {
-    	def zoneId = it['@zone'].toString()
-    	def elkAttributes = rawElkList[zoneId]
-        def type = it['@type'].toString()
-        def value = it['@val'].toString()
-        elkAttributes[type] = value
-        rawElkList[zoneId] = elkAttributes
-    }
-    
-    //log.debug 'ISYSMARTAPP: Processing the final elk list'
-    //log.debug 'ISYSMARTAPP: List: '+rawElkList
-    
-    //log.debug 'ISYSMARTAPP: List: '+rawElkList['1']
-    
-    
-    rawElkList.each {
-    	//log.debug 'ISYSMARTAPP: Processing zone: '+it.key
-        def voltageEntry = it.value['53'].toInteger()
-        //log.debug 'ISYSMARTAPP: Voltage of node: '+voltageEntry
-        if(voltageEntry < 65 || voltageEntry > 80) {
-        	//log.debug 'ISYSMARTAPP: Adding new elk zone: '+it.value['name']
-            def addressToUse = getDeviceNetworkIdForElkZone(it.key)
-            //log.debug 'ISYSMARTAPP: Adding elk zone with dni: '+addressToUse
-            def device = getChildDevice(addressToUse);
-            if(device == null) {
-            	newDevice = addChildDevice('rodtoll', 'ISYElkAlarmSensor', addressToUse, null, [label:it.value['name'],completedSetup:true]) 
-           	} else {
-                newDevice.setFromZoneUpdate(51,it.value['51'].toInteger())
-                newDevice.setFromZoneUpdate(52,it.value['52'].toInteger())
-                newDevice.setFromZoneUpdate(53,it.value['53'].toInteger())
-            }
-        } else {
-        	//log.debug 'ISYSMARTAPP: Ignoring node, voltage Is wrong'
-        }
-    }
-    
-	setCurrentLoadState("LoadElkStatus2")
-
-	sendSubscribeCommand()
-}
-
-def handleXmlMessage(xml) {
-	//log.debug "ISYSMARTAPP: Processing xml message"
-    //try {
-        if(xml.name() == 'nodes') {
-        	if(atomicState.loadingState == "InitialStatusRequest") {
-                handleInitialStatusMessage(xml)
-                setCurrentLoadState("LoadingNodeDetails")
-                sendNextGetInfoRequest()
-            } else {
-            	handleStatusMessage(xml)
-            }
-        } else if(xml.name() == 'nodeInfo') {
-            handleNodeInfoMessage(xml)
-        } else if(xml.name() == 'topology') {
-        	handleElkTopologyMessage(xml)
-        } else if(xml.name() == 'status') {
-        	if(atomicState.loadingState.startsWith('LoadElkStatusDetails')) {
-            	handleElkStatusMessageForDetails(xml)
-            } else {
-        		handleElkStatusMessage(xml)        
-            }
-        } else if(xml.name() == 'Envelope') {
-            setCurrentLoadState("LoadCompleted")
-            def hubDevice = getChildDevice(atomicState.hubDni)
-            log.debug 'ISYSMARTAPP: Hub device '+hubDevice
-            log.debug 'ISYSMARTAPP: XML: '+xml.toString()
-            hubDevice.setSubscribIdFromResponse(xml)
-            //log.debug 'ISYSMARTAPP: Got an envelope message'
-            //log.debug 'ISYSMARTAPP: Envelope '+xml.toString()
-        } else if(xml.name() == 'Event') {
-            //log.debug 'ISYSMARTAPP: Got a node update message'       
-        	handleNodeUpdateMessage(xml)
-        } else {
-        	log.debug 'ISYSMARTAPP: Ignoring malformed message. Message='+xml.name()
-        }
-    //} catch(e) {
-      //  log.debug 'Error parsing devices: '+e
-    //}
-}
-
-def locationHandler(evt) {
-    //try {
-        def msg = parseLanMessage(evt.description)
-        if(!msg.xml) {
-        	if(msg.body && msg.body.length() > 0) {
-	            msg.xml = new XmlSlurper().parseText(msg.body)
-            }
-        } 
-        if(msg.xml) {
-        	//log.debug 'Received command... ' + msg.xml.name()
-        	handleXmlMessage(msg.xml)
-        } else {
-            //log.debug 'ISYSMARTAPP: Received non-xml command: '+ msg
-        }
-    //} catch(e) {
-    //    log.debug 'ERROR -- Details: '+ e
-   // }
-}
-
-def initialize() {
-	setCurrentLoadState("Setup")
-	findHub()
-	subscribe(location, null, locationHandler, [filterEvents:false])
-	setCurrentLoadState("InitialStatusRequest")
-    sendHubCommand(getRequest('/rest/status'))
-}
-
-def doRefresh() {
-    sendHubCommand(getRequest('/rest/status'))
-}
-
-def getRequest(path) {
-	//log.debug "Building request..."+path+" host: "+settings.isyAddress+":"+settings.isyPort+" auth="+getAuthorization()
-    new physicalgraph.device.HubAction(
-        'method': 'GET',
-        'path': path,
-        'headers': [
-            'HOST': settings.isyAddress+":"+settings.isyPort,
-            'Authorization': getAuthorization()
-        ], null)
-}
-
-def getDeviceAddressSafeForUrl(device) {
-	return getStringSafeForUrl(device.device.deviceNetworkId)
-}
-
-def getStringSafeForUrl(value) {
-	return value.toString().replaceAll(' ', '%20')
-}
+///////////////////////////////////////////////////////////
+// Command Execution (SmartThings->ISY)
+//
+// Insteon Devices
 
 def on(device,address) {
     def command = '/rest/nodes/'+getStringSafeForUrl(address)+'/cmd/DON'
-	sendHubCommand(getRequest(command))
+	sendHubCommand(getRestGetRequest(command))
 }
 
 def off(device,address) {
     def command = '/rest/nodes/'+getStringSafeForUrl(address)+'/cmd/DOF'
-	sendHubCommand(getRequest(command))
+	sendHubCommand(getRestGetRequest(command))
 }
 
 def setDim(device, level,address) {
 	def isyLevel = scaleSTRangeToISYDeviceLevel(level)
     def command = '/rest/nodes/'+getStringSafeForUrl(address)+'/cmd/DON/'+isyLevel
-	sendHubCommand(getRequest(command))
+	sendHubCommand(getRestGetRequest(command))
 }
 
 def setDimNoTranslation(device, isyLevel,address) {
     def command = '/rest/nodes/'+getStringSafeForUrl(address)+'/cmd/DON/'+isyLevel
-	sendHubCommand(getRequest(command))
+	sendHubCommand(getRestGetRequest(command))
 }
+
+def sendGetNodeInfo(address) {
+	def command = '/rest/nodes/'+getStringSafeForUrl(address)
+    sendHubCommand(getRestGetRequest(command))
+}
+
+///////////////////////////////////////////////////////////
+// Command Execution (SmartThings->ISY)
+//
+// ZWave Devices
 
 def secureLockCommand(device, address, locked) {
     def command = '/rest/nodes/'+getStringSafeForUrl(address)+'/cmd/SECMD/'
@@ -760,17 +724,22 @@ def secureLockCommand(device, address, locked) {
     } else {
     	command = command + "0"
     }
-	sendHubCommand(getRequest(command))
+	sendHubCommand(getRestGetRequest(command))
 }
 
-def uninstalled() {
-	def currentState = atomicState.loadingState
-	log.debug "ISYSMARTAPP: Uninstalling. In current state: "+currentState
-	if(atomicState.hubDni != null && currentState == "LoadCompleted") {
-    	log.debug "ISYSMARTAPP: Doing an unsubscribe"
-    	def hubDevice = getChildDevice(atomicState.hubDni);
-        hubDevice.unsubscribe()
-    } else {
-    	log.debug "ISYSMARTAPP: Not unsubscribing, not needed."
-    }
+def sendStatusRequest() {
+    sendHubCommand(getRestGetRequest('/rest/status'))
+}
+
+///////////////////////////////////////////////////////////
+// Command Execution (SmartThings->ISY)
+//
+// Elk Devices
+
+def sendElkStatusRequest() {
+	sendHubCommand(getRestGetRequest('/rest/elk/get/status'))    	
+}
+
+def sendElkTopologyRequest() {
+	sendHubCommand(getRestGetRequest('/rest/elk/get/topology'))    	
 }
