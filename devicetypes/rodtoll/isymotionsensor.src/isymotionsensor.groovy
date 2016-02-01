@@ -64,7 +64,8 @@ def parse(String description) {
 }
 
 def setISYState(address,state) {
-	if(parent.getSubAddress(address)=='1') {
+	def subAddress = parent.getIsySubAddress(address)
+	if(subAddress=='1') {
     	sendEvent(name: 'isyAddress', value: address)
         log.debug 'ISYMOTIONSENSOR: Handling incoming motion sensor set value to: '+state
         if(state == 255) {
@@ -72,14 +73,14 @@ def setISYState(address,state) {
         } else {
             sendEvent(name: 'motion', value: 'inactive')
         }
-	} else if(parent.getSubAddress(address)=='2'){
+	} else if(subAddress=='2'){
     	log.debug 'ISYMOTIONSENSOR: Handling incoming motion sensor light value to: '+state
         def newIlluminance = 0
         if(state != ' ') {
         	newIlluminance = parent.scaleISYDeviceLevelToSTRange(state)
         }
         sendEvent(name: 'illuminance', value: newIlluminance)
-	} else if(parent.getSubAddress(address)=='3'){
+	} else if(subAddress=='3'){
     	log.debug 'ISYMOTIONSENSOR: Handling incoming motion sensor battery value to: '+state
         if(state == 0 || state == ' ') {
         	sendEvent(name: 'battery', value: 100)

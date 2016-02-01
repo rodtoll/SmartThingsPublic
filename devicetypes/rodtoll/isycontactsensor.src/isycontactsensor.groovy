@@ -57,7 +57,7 @@ def parse(String description) {
 }
 
 def setISYState(address,state) {
-	if(parent.getSubAddress(address)=='1') {
+	if(parent.getIsySubAddress(address)=='1') {
     	sendEvent(name: 'isyAddress', value: address)
         log.debug 'ISYCONTACTSENSOR: Handling incoming contact sensor set value to: '+state
         if(state == 0 || state == ' ') {
