@@ -96,37 +96,11 @@ def putImageInS3(map) {
 	}
 }
 
-// handle commands
-/*def take() {
-	log.debug "Executing 'take'"
-	//Snapshot uri depends on model number:
-	//because 8 series uses user and 9 series uses usr -
-	//try based on port since issuing a GET with usr to 8 series causes it throw 401 until you reauthorize using basic digest authentication
-
-	def host = getHostAddress()
-	def port = host.split(":")[1]
-	def path = (port == "80") ? "/snapshot.cgi?user=${getUsername()}&pwd=${getPassword()}" : "/cgi-bin/CGIProxy.fcgi?usr=${getUsername()}&pwd=${getPassword()}&cmd=snapPicture2"
-
-
-	def hubAction = new physicalgraph.device.HubAction(
-		method: "GET",
-		path: path,
-		headers: [HOST:host]
-	)
-	hubAction.options = [outputMsgToS3:true]
-	hubAction
-}*/
-
 //////////////////////
 // WORKING METHODS
 //
 
 def take() {
-	/*def requestPath = '/PSIA/Streaming/channels/'+device.currentValue('cameraIndex').toString()+'01/picture'
-	log.debug "SWANNNVRCAMERA: Taking picture using..."+requestPath
-    def request = getRequest(requestPath)
-    log.debug "SWANNNVRCAMERA: Request: "+request
-    sendHubCommand(request)*/
     parent.take(device.currentValue('cameraIndex'))
 }
 
