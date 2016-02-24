@@ -15,7 +15,7 @@
  *  Author: rodtoll
  */
  metadata {
-	definition (name: "SwannNVRCamera", namespace: "rodtoll", author: "SmartThings") {
+	definition (name: "SwannNVRCamera", namespace: "rodtoll", author: "Rod Toll") {
 		capability "Actuator"
 		capability "Image Capture"
         attribute "cameraIndex", "number"        
