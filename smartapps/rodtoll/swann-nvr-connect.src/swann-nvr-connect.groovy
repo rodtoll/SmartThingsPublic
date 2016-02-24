@@ -18,7 +18,7 @@
 definition(
     name: "Swann NVR (Connect)",
     namespace: "rodtoll",
-    author: "SmartThings",
+    author: "Rod Toll",
     description: "Connect and take pictures using your Swann NVR from inside the application.",
     iconUrl: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience.png",
     iconX2Url: "https://s3.amazonaws.com/smartapp-icons/Convenience/Cat-Convenience@2x.png",
