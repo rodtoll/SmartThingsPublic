@@ -30,7 +30,7 @@
             input "swannAddress", "text", title: "ISY Address", required: false, defaultValue: "10.0.1.80" 			// Address of the swann Nvr
             input "swannPort", "number", title: "Swann NVR Port", required: false, defaultValue: 85 				// Port to use for the HTTP interface
             input "swannUserName", "text", title: "User Name", required: false, defaultValue: "admin"				// Username to use with the NVR
-			input "swannPassword", "text", title: "Password", required: false, defaultValue: "Alpha1Romero"			// Password to use with the NVR
+			input "swannPassword", "text", title: "Password", required: false, defaultValue: "Password"			// Password to use with the NVR
 	}
 
 	tiles {
